@@ -1,0 +1,16 @@
+streamlit==1.58.0
+pandas==3.0.2
+altair>=5.0
+# school verification (document reading + fuzzy matching)
+PyMuPDF>=1.24
+rapidfuzz>=3.6
+# research-track predictive modelling (Stage 4 calibration + Stage 5 fairness)
+scikit-learn>=1.5
+lightgbm>=4.3
+shap>=0.45
+numpy>=1.26
+# optional OCR fallback for scanned transcripts (also: apt install tesseract-ocr)
+# pytesseract>=0.3.10
+# Pillow>=10.0
+# dev / testing
+pytest>=8.0

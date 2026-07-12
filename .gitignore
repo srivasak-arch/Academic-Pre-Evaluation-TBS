@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+build/
+dist/
+*.spec.bak
+.venv/
+# NOTE: data/dashboard.db is deliberately NOT ignored — the seeded database
+# must be committed so the deployed app boots with the synthetic cohort.
