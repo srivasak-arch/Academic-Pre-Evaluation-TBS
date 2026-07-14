@@ -75,6 +75,10 @@ a, a:visited { color: var(--brand); }
 
 /* ---- Indicator chips (evidence colours only — never brand blue) ---- */
 .chiprow { display:flex; flex-wrap:wrap; gap:10px; margin:0.4rem 0 0.2rem 0; }
+.context-strip { margin-top:2px; padding-top:6px; border-top:1px dashed #D5D9DE; opacity:0.92; }
+.context-strip .chip { background:#F4F5F7 !important; color:#4A4F55 !important; border-color:#D5D9DE !important; }
+.context-strip-label { font-size:0.72rem; color:#7A8087; align-self:center; margin-right:6px; }
+
 .chip {
   border-radius:10px; padding:9px 12px; min-width:150px; flex:1 1 150px;
   border:1.5px solid; font-size:0.82rem; line-height:1.25; background-color: var(--surface);
@@ -121,15 +125,41 @@ def chip_html(result) -> str:
     )
 
 
-def chip_row(results):
-    chips = "".join(chip_html(r) for r in results)
+def split_results(results):
+    """Partition indicator results into (scored, contextual).
+
+    Contextual results (scale == 'neutral') are informational only. Following the
+    Stage 4/5 evaluation — which found institutional tier carries no reliable
+    predictive signal (single-facet AUC 0.47) while being the facet most exposed
+    to prestige bias — contextual facets are rendered in a visually separate
+    strip, never alongside the scored advisory chips.
+    """
+    scored = [r for r in results if r.scale != "neutral"]
+    contextual = [r for r in results if r.scale == "neutral"]
+    return scored, contextual
+
+
+def chip_row(results, show_context_note: bool = False):
+    scored, contextual = split_results(results)
+    chips = "".join(chip_html(r) for r in scored)
     st.markdown(f'<div class="chiprow">{chips}</div>', unsafe_allow_html=True)
+    if contextual:
+        ctx = "".join(chip_html(r) for r in contextual)
+        st.markdown(
+            f'<div class="chiprow context-strip">'
+            f'<span class="context-strip-label">Context — informational only, not scored:</span>'
+            f'{ctx}</div>', unsafe_allow_html=True)
+        if show_context_note:
+            st.caption("Institutional tier is shown for context, never scored: the "
+                       "evaluation found it carries no reliable predictive signal, "
+                       "and scoring it would import prestige bias for no benefit.")
 
 
 def legend():
     st.markdown(
         '<div class="legend">'
-        '✓ Green · ! Amber · ✕ Red · … Evidence pending · ⓘ Context (not scored) · '
+        '✓ Green · ! Amber · ✕ Red · … Evidence pending · '
+        'Context strip = informational only, deliberately unscored · '
         'hatched/outlined = lower-confidence evidence. '
         'Indicators are independent and advisory — there is no overall score or ranking.'
         '</div>', unsafe_allow_html=True)

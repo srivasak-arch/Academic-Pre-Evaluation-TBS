@@ -211,7 +211,7 @@ def profile_page():
     _audit("applicant_open", entity_type="application", entity_id=app_id)
     st.markdown('<div class="section-label">Academic indicators (independent · advisory)</div>',
                 unsafe_allow_html=True)
-    chip_row(results)
+    chip_row(results, show_context_note=True)
     legend()
 
     # (C) progressive-disclosure evidence

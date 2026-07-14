@@ -7,7 +7,33 @@ from datetime import datetime, timezone
 from .config import DB_PATH, SCHEMA_PATH
 
 
+def _database_is_initialised(conn: sqlite3.Connection) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='app_user'"
+    ).fetchone() is not None
+
+
+def bootstrap_if_needed() -> None:
+    """Build the database from the synthetic CSV if it is missing or empty.
+
+    sqlite3.connect() silently creates an empty file when the database does not
+    exist, so a missing DB surfaces later as 'no such table: app_user'. On hosts
+    with an ephemeral filesystem (e.g. Streamlit Community Cloud) the store is
+    wiped on every container rebuild, so the app must be able to reconstruct it
+    from source data committed to the repository.
+    """
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    try:
+        if _database_is_initialised(conn):
+            return
+    finally:
+        conn.close()
+    from .ingest import build          # imported lazily to avoid a circular import
+    build()
+
+
 def get_connection() -> sqlite3.Connection:
+    bootstrap_if_needed()
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
