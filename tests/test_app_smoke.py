@@ -18,11 +18,14 @@ def test_queue_is_default_page():
     assert any("Work queue" in m.value for m in at.markdown if isinstance(m.value, str))
 
 
-def test_queue_renders_selectable_dataframe():
+def test_queue_renders_per_row_review_buttons():
+    # Reverted to per-row Review buttons (team decision, July 2026): each row
+    # carries its own button; the selectable dataframe is gone. Paginated at 15.
     at = AppTest.from_file(APP, default_timeout=30).run()
     assert not at.exception
-    assert len(at.dataframe) == 1          # queue is now a single sortable dataframe
-    assert not [b for b in at.button if b.label == "Review"]  # old per-row buttons gone
+    review_buttons = [b for b in at.button if b.label == "Review"]
+    assert 1 <= len(review_buttons) <= 15
+    assert len(at.dataframe) == 0
 
 
 def test_profile_opens_when_application_selected():

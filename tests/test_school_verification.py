@@ -131,3 +131,33 @@ def test_verification_roundtrip_confirm_vs_corrected(conn):
     status2 = confirm_school(conn, ver2, "Hindu College", "Miranda House", user_id=1)
     assert status2 == "corrected"
     assert len(db.list_school_verifications(conn)) == 2
+
+
+# ---------------- A/B linking: attach and create ----------------
+def test_prefill_extraction_safe_vs_evidence_only():
+    from src.doc_prefill import extract_prefill
+    pages = [{"page": 1, "ocr": False, "text": (
+        "Student Name:\nAsha Rao\nProgramme:\nB.Com (Hons.) Finance\n"
+        "Period of Study:\n2020–2023\nMedium of Instruction: English\n"
+        "Official Grade\n7.9 / 10.00\nResult Awarded\nFirst Class")}]
+    pf = extract_prefill(pages, known_subjects=["Finance", "Economics"])
+    assert pf["forename"]["value"] == "Asha" and pf["surname"]["value"] == "Rao"
+    assert pf["subject_name"]["value"] == "Finance"
+    assert pf["graduation_year"]["value"] == 2023
+    # grade and english are evidence-only: never a fillable value
+    assert pf["grade_evidence"]["value"] is None
+    assert "7.9 / 10.00" in pf["grade_evidence"]["evidence"]
+    assert pf["english_evidence"]["value"] is None
+
+
+def test_attach_links_verification_to_existing_applicant(conn):
+    from src.school_service import attach_to_applicant
+    ver_id = db.add_school_verification(conn, {
+        "applicant_id": "APP-777", "detected_school": "Hindu College",
+        "detected_university": "University of Delhi"})
+    attach_to_applicant(conn, ver_id, "TBS-2026-0042", user_id=1)
+    # profile lookups by the REAL applicant id now find it
+    row = db.latest_school_verification(conn, "TBS-2026-0042")
+    assert row is not None and row["verification_id"] == ver_id
+    # and the original document-derived key still resolves (provenance kept)
+    assert db.latest_school_verification(conn, "APP-777")["verification_id"] == ver_id

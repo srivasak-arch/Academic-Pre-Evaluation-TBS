@@ -7,8 +7,21 @@ from src import db, services
 
 
 @pytest.fixture
-def conn():
-    c = db.get_connection()
+def conn(tmp_path, monkeypatch):
+    """A disposable copy of the real database.
+
+    Workflow tests exercise real writes (add_student, threshold edits), so they
+    must never run against data/dashboard.db — earlier versions of this fixture
+    did, and every pytest run permanently appended test applicants ('Ada Test',
+    'Yuki Sato') to the shipped database.
+    """
+    import shutil, sqlite3
+    dst = tmp_path / "dashboard.db"
+    shutil.copy(db.DB_PATH, dst)
+    monkeypatch.setattr(db, "DB_PATH", dst)
+    c = sqlite3.connect(dst, check_same_thread=False)
+    c.row_factory = sqlite3.Row
+    c.execute("PRAGMA foreign_keys = ON")
     yield c
     c.close()
 
