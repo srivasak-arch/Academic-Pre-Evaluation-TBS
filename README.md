@@ -6,7 +6,11 @@ an admissions reviewer can evaluate applicants faster, more consistently, and
 more transparently — while the **human always makes the final decision**.
 
 It supports two programmes — **MSc Business Analytics (BA)** and
-**MSc International Management (IM)** — on synthetic data only
+**MSc International Management (IM)** — on synthetic data only, and is fully
+independent of Team B.
+
+> **This build has no login.** It opens straight into a single combined view with
+> review, oversight, governance (thresholds), and data/admin all available.
 
 ## Run it as a single double-click app (no terminal, no Python)
 
