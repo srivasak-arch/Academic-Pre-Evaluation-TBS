@@ -63,7 +63,10 @@ def group_uploads(files) -> dict[str, dict[str, list[dict]]]:
 def run_verification(conn, applicant_id: str, docs: dict[str, list[dict]],
                      declared_university: str | None, user_id=None) -> tuple[int, SchoolDetection]:
     """Detect + persist one pending verification row. Returns (row id, detection)."""
+    import json as _json
+    from .doc_prefill import extract_prefill
     det = verify_schooling(docs, declared_university)
+    prefill = extract_prefill(docs.get("transcript", [])) if docs.get("transcript") else {}
     ver_id = db.add_school_verification(conn, {
         "applicant_id": applicant_id,
         "declared_university": det.declared_university or declared_university,
@@ -76,6 +79,7 @@ def run_verification(conn, applicant_id: str, docs: dict[str, list[dict]],
         "corroborated": det.corroborated,
         "university_mismatch": det.university_mismatch,
         "notes": " | ".join(det.notes) if det.notes else None,
+        "prefill_json": _json.dumps(prefill) if prefill else None,
     })
     db.audit(conn, user_id, "school_detection_run", entity_type="applicant",
              entity_id=applicant_id,
@@ -91,3 +95,11 @@ def confirm_school(conn, verification_id: int, detected_school: str | None,
     db.audit(conn, user_id, f"school_{status}", entity_type="school_verification",
              entity_id=str(verification_id), detail={"school": chosen_school})
     return status
+
+
+def attach_to_applicant(conn, verification_id: int, applicant_id: str, user_id) -> None:
+    """A: link a document-derived verification to an existing applicant record."""
+    db.link_school_verification(conn, verification_id, applicant_id)
+    db.audit(conn, user_id, "school_verification_linked",
+             entity_type="school_verification", entity_id=str(verification_id),
+             detail={"linked_applicant_id": applicant_id})

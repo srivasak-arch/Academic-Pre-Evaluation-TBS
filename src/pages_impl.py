@@ -133,35 +133,34 @@ def queue_page():
         "_id": r["application_id"],
     } for r in rows])
 
-    st.caption("Click a column header to sort · select a row to open the applicant. "
-               "Sorting is a view aid only — the queue is not ranked by quality.")
-    event = st.dataframe(
-        df,
-        hide_index=True,
-        width="stretch",
-        height=min(560, 44 + 35 * min(len(df), 15)),
-        on_select="rerun",
-        selection_mode="single-row",
-        column_order=["Applicant", "Programme", "Country", "Graduated", "Readiness", "Decision"],
-        column_config={
-            "Applicant": st.column_config.TextColumn("Applicant", pinned=True,
-                help="Applicant reference"),
-            "Programme": st.column_config.TextColumn("Programme", width="small"),
-            "Country": st.column_config.TextColumn("Country"),
-            "Graduated": st.column_config.NumberColumn("Graduated", format="%d", width="small"),
-            "Readiness": st.column_config.TextColumn("Readiness"),
-            "Decision": st.column_config.TextColumn("Decision", width="small"),
-        },
-    )
-    picked = event.selection.rows if event and event.selection else []
-    if not picked:
-        # nothing selected (e.g. returning from a profile) — clear the open-guard
-        st.session_state.pop("_last_queue_pick", None)
-    else:
-        app_id = int(df.iloc[picked[0]]["_id"])
-        if st.session_state.get("_last_queue_pick") != app_id:
-            st.session_state["_last_queue_pick"] = app_id
-            st.session_state["goto_application"] = app_id
+    # ---- paginated rows, each with its own Review button ----
+    PAGE_SIZE = 15
+    sort_by = st.selectbox("Sort by", ["Applicant", "Programme", "Country",
+                                       "Graduated", "Readiness", "Decision"],
+                           index=0, key="queue_sort",
+                           help="A view aid only — the queue is not ranked by quality.")
+    df = df.sort_values(sort_by, kind="stable").reset_index(drop=True)
+
+    n_pages = max(1, -(-len(df) // PAGE_SIZE))
+    page = st.number_input(f"Page (of {n_pages})", 1, n_pages, 1, key="queue_page") - 1
+    view = df.iloc[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
+
+    widths = [2.2, 1.2, 1.8, 1.1, 1.8, 1.3, 1.1]
+    hdr = st.columns(widths)
+    for col, label in zip(hdr, ["Applicant", "Programme", "Country", "Graduated",
+                                "Readiness", "Decision", ""]):
+        col.markdown(f"**{label}**")
+    for _, r in view.iterrows():
+        c = st.columns(widths)
+        c[0].markdown(r["Applicant"])
+        c[1].markdown(r["Programme"])
+        c[2].markdown(r["Country"])
+        c[3].markdown(str(r["Graduated"]))
+        c[4].markdown(r["Readiness"])
+        c[5].markdown(r["Decision"])
+        if c[6].button("Review", key=f"review_{r['_id']}", type="secondary",
+                       use_container_width=True):
+            st.session_state["goto_application"] = int(r["_id"])
             st.switch_page(st.session_state["_pages"]["profile"])
     with st.expander("Legend — how to read the indicators"):
         legend()
@@ -1164,6 +1163,29 @@ def _sv_review_card(conn, row, school_names_for, university_names):
             st.success(f"Recorded as **{status}** → {chosen}. Logged with your name and time.")
             st.rerun()
 
+        st.markdown("**Then connect this verification to the applicant list:**")
+        a_col, b_col = st.columns(2)
+        with a_col:  # ---- A: attach to an existing applicant ----
+            people = db.list_applicants_brief(conn)
+            labels = [f'{p["applicant_id"]} — {p["name"]}' for p in people]
+            pick = st.selectbox("Attach to existing applicant", labels, index=None,
+                                key=f"sv_att_{ver_id}",
+                                placeholder="Search by ID or name…")
+            if st.button("Attach", key=f"sv_attbtn_{ver_id}", disabled=pick is None):
+                target = people[labels.index(pick)]["applicant_id"]
+                SV.attach_to_applicant(conn, ver_id, target, _user()["user_id"])
+                st.success(f"Verification attached to **{target}** — the confirmed "
+                           "school now shows on their profile.")
+                st.rerun()
+        with b_col:  # ---- B: create a new applicant from the documents ----
+            if st.button("Create new applicant from these documents…",
+                         key=f"sv_new_{ver_id}"):
+                st.session_state["sv_create_from"] = ver_id
+                st.rerun()
+
+    if st.session_state.get("sv_create_from") == row["verification_id"]:
+        _sv_create_applicant_form(conn, row)
+
 
 # ---------------------------------------------------------------------------
 # Predictive analytics (research track) — NEVER operational
@@ -1263,3 +1285,97 @@ def predictive_analytics_page():
     st.dataframe(fdf, hide_index=True, use_container_width=True)
     st.caption("Small-N cells are reported descriptively, not audited — a stated "
                "limitation of the 420-record synthetic cohort.")
+
+
+def _sv_create_applicant_form(conn, row):
+    """B: create a new applicant, pre-filled from the documents with evidence shown.
+    Safe fields are suggested; grade and English are evidence-only and stay manual."""
+    from .countries import COUNTRY_NAMES
+    pf = json.loads(row["prefill_json"]) if row["prefill_json"] else {}
+    g = lambda k, d=None: (pf.get(k) or {}).get("value", d)
+    ev = lambda k: (pf.get(k) or {}).get("evidence")
+
+    st.markdown("---")
+    st.markdown(f"#### New applicant from documents of **{row['applicant_id']}**")
+    st.caption("Every pre-filled value below is a suggestion extracted from the "
+               "transcript, shown with its evidence — confirm or correct each one. "
+               "Grade and English level are never pre-filled: the transcript's "
+               "grade is shown as evidence and the Irish equivalent is your call.")
+
+    tiers = db.list_tiers(conn)
+    subjects = db.list_subjects(conn)
+    verified_school = row["verified_school"] or row["detected_school"] or ""
+    parent = row["detected_university"] or row["declared_university"] or ""
+    inst_default = f"{verified_school} ({parent})" if verified_school else parent
+
+    with st.form(f"sv_create_{row['verification_id']}"):
+        c1, c2 = st.columns(2)
+        forename = c1.text_input("Forename", value=g("forename", ""))
+        surname = c2.text_input("Surname", value=g("surname", ""))
+        if ev("forename"): st.caption(ev("forename"))
+        c3, c4, c5 = st.columns(3)
+        country = c3.selectbox("Country", COUNTRY_NAMES, index=None,
+                               placeholder="Select…")
+        nationality = c4.selectbox("Nationality", COUNTRY_NAMES, index=None,
+                                   placeholder="Select…")
+        gender = c5.selectbox("Gender", GENDERS, index=None, placeholder="Select…")
+        c6, c7 = st.columns(2)
+        age = c6.number_input("Age", 20, 45, 24)
+        programme = c7.selectbox("Target programme", list(PROGRAMMES.keys()),
+                                 format_func=lambda k: f"{PROGRAMMES[k]} ({k})")
+        c8, c9 = st.columns([2, 1])
+        institution = c8.text_input("Institution name", value=inst_default)
+        st.caption(f"From the confirmed school verification: {verified_school} — "
+                   f"constituent of {parent}.")
+        tier = c9.selectbox("Institution type", [t for t, _ in tiers],
+                            format_func=lambda t: dict(tiers)[t])
+        c10, c11 = st.columns(2)
+        subj_default = subjects.index(g("subject_name")) if g("subject_name") in subjects else None
+        subject = c10.selectbox("Subject area", subjects, index=subj_default)
+        if ev("subject_name"): st.caption(ev("subject_name"))
+        grad = c11.number_input("Graduation year", 2014, 2026,
+                                int(g("graduation_year", 2025)))
+        if ev("graduation_year"): st.caption(ev("graduation_year"))
+
+        c12, c13 = st.columns(2)
+        has_grade = c12.checkbox("Grade on file", value=False)
+        grade = c12.number_input("Grade (Irish eq. %)", 0.0, 100.0, 62.0,
+                                 disabled=False)
+        if ev("grade_evidence"): c12.warning(ev("grade_evidence"))
+        english = c13.selectbox("English level", ENGLISH_OPTIONS)
+        if ev("english_evidence"): c13.info(ev("english_evidence"))
+        c14, c15 = st.columns(2)
+        work = c14.selectbox("Work experience", WORK_OPTIONS)
+        yrs = c15.number_input("Years' experience", 0, 30, 0)
+        ok = st.form_submit_button("Create applicant", type="primary")
+
+    if st.button("Cancel", key=f"sv_cancel_{row['verification_id']}"):
+        st.session_state.pop("sv_create_from", None)
+        st.rerun()
+
+    if ok:
+        if not (forename.strip() and surname.strip() and country and nationality
+                and gender and subject and institution.strip()):
+            st.error("Complete the required fields (name, country, nationality, "
+                     "gender, subject, institution) before creating.")
+            return
+        data = dict(
+            applicant_id=db.next_applicant_id(conn),
+            surname=surname.strip(), forename=forename.strip(),
+            country_name=country, nationality_name=nationality, age=int(age),
+            gender=gender, institution_name=institution.strip(), tier_code=tier,
+            subject_name=subject, graduation_year=int(grad),
+            grade_irish_eq=float(grade) if has_grade else None,
+            english_level=None if english == "Not on file yet" else english,
+            work_experience=work, years_experience=int(yrs),
+            programme_code=programme)
+        from . import school_service as SV
+        app_id = services.add_student(conn, data, _user()["user_id"])
+        SV.attach_to_applicant(conn, row["verification_id"],
+                               data["applicant_id"], _user()["user_id"])
+        st.session_state.pop("sv_create_from", None)
+        st.success(f"Created **{data['applicant_id']}** from {row['applicant_id']}'s "
+                   f"documents (application #{app_id}) and attached the school "
+                   "verification. The applicant is now in the work queue"
+                   + ("" if has_grade else " as *awaiting evidence* until a grade "
+                      "and English level are recorded") + ".")

@@ -459,6 +459,12 @@ def ensure_school_schema(conn):
         );
         CREATE INDEX IF NOT EXISTS idx_sv_applicant ON school_verification(applicant_id);
     """)
+    # idempotent column additions for databases created before A/B linking existed
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(school_verification)")}
+    if "linked_applicant_id" not in cols:
+        conn.execute("ALTER TABLE school_verification ADD COLUMN linked_applicant_id TEXT")
+    if "prefill_json" not in cols:
+        conn.execute("ALTER TABLE school_verification ADD COLUMN prefill_json TEXT")
     conn.commit()
     _SV_DDL_DONE = True
 
@@ -477,6 +483,10 @@ def add_school_verification(conn, rec: dict) -> int:
          rec.get("evidence_snippet"), int(rec.get("corroborated", 0)),
          int(rec.get("university_mismatch", 0)), rec.get("notes"),
          rec.get("status", "pending"), now_iso()))
+    if rec.get("prefill_json"):
+        conn.execute("UPDATE school_verification SET prefill_json=? WHERE verification_id=?",
+                     (rec["prefill_json"], cur.lastrowid))
+        conn.commit()
     conn.commit()
     return cur.lastrowid
 
@@ -506,8 +516,25 @@ def list_school_verifications(conn, status=None):
 def latest_school_verification(conn, applicant_id):
     ensure_school_schema(conn)
     return conn.execute(
-        "SELECT * FROM school_verification WHERE applicant_id=? "
-        "ORDER BY verification_id DESC LIMIT 1", (applicant_id,)).fetchone()
+        "SELECT * FROM school_verification "
+        "WHERE applicant_id=? OR linked_applicant_id=? "
+        "ORDER BY verification_id DESC LIMIT 1",
+        (applicant_id, applicant_id)).fetchone()
+
+
+def link_school_verification(conn, verification_id, applicant_id):
+    """Attach a verification (run on uploaded documents) to a real applicant record."""
+    ensure_school_schema(conn)
+    conn.execute("UPDATE school_verification SET linked_applicant_id=? WHERE verification_id=?",
+                 (applicant_id, verification_id))
+    conn.commit()
+
+
+def list_applicants_brief(conn, limit=1000):
+    """(applicant_id, display name) pairs for attach dropdowns."""
+    return conn.execute(
+        "SELECT applicant_id, forename || ' ' || surname AS name "
+        "FROM applicant ORDER BY applicant_id LIMIT ?", (limit,)).fetchall()
 
 
 # ---------- Research-track ML tables (NEVER feed the advisory indicators) ----------
