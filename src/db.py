@@ -598,3 +598,76 @@ def add_ml_predictions(conn, run_id, model_name, applicant_ids, y_true, p_uncal,
 def latest_ml_run(conn):
     ensure_ml_schema(conn)
     return conn.execute("SELECT * FROM ml_run ORDER BY run_id DESC LIMIT 1").fetchone()
+
+
+# ---------- Latest decision VALUE per application (for offer-status sort/export) ----------
+def latest_decision_values(conn):
+    """{application_id: decision_value} for the most recent decision on each application."""
+    rows = conn.execute(
+        "SELECT application_id, decision_value FROM decision d "
+        "WHERE decision_id = (SELECT MAX(decision_id) FROM decision "
+        "                     WHERE application_id = d.application_id)").fetchall()
+    return {r["application_id"]: r["decision_value"] for r in rows}
+
+
+# ---------- Additional education history (prior degrees beyond the primary record) ----------
+_EDU_DDL_DONE = False
+
+def ensure_education_schema(conn):
+    global _EDU_DDL_DONE
+    if _EDU_DDL_DONE:
+        return
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS education_history (
+            education_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+            applicant_id    TEXT NOT NULL REFERENCES applicant(applicant_id),
+            qualification   TEXT NOT NULL,          -- e.g. Bachelor's, Master's, Diploma
+            institution_name TEXT NOT NULL,
+            subject_name    TEXT,
+            country_name    TEXT,
+            graduation_year INTEGER,
+            grade_note      TEXT,                   -- free text: grade as stated, not normalised
+            created_at      TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_edu_applicant ON education_history(applicant_id);
+    """)
+    conn.commit()
+    _EDU_DDL_DONE = True
+
+
+def add_education(conn, rec: dict) -> int:
+    ensure_education_schema(conn)
+    cur = conn.execute(
+        "INSERT INTO education_history (applicant_id, qualification, institution_name, "
+        "subject_name, country_name, graduation_year, grade_note, created_at) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        (rec["applicant_id"], rec["qualification"], rec["institution_name"],
+         rec.get("subject_name"), rec.get("country_name"), rec.get("graduation_year"),
+         rec.get("grade_note"), now_iso()))
+    conn.commit()
+    return cur.lastrowid
+
+
+def list_education(conn, applicant_id):
+    ensure_education_schema(conn)
+    return conn.execute(
+        "SELECT * FROM education_history WHERE applicant_id=? "
+        "ORDER BY graduation_year DESC, education_id DESC", (applicant_id,)).fetchall()
+
+
+def delete_education(conn, education_id):
+    ensure_education_schema(conn)
+    conn.execute("DELETE FROM education_history WHERE education_id=?", (education_id,))
+    conn.commit()
+
+
+# ---------- Reviewer notes concatenated per application (for portal export) ----------
+def notes_by_application(conn):
+    """{application_id: 'note1 | note2 | …'} — all reviewer notes, oldest first."""
+    rows = conn.execute(
+        "SELECT application_id, body FROM reviewer_note "
+        "ORDER BY application_id, created_at, note_id").fetchall()
+    out = {}
+    for r in rows:
+        out.setdefault(r["application_id"], []).append(r["body"])
+    return {aid: " | ".join(bodies) for aid, bodies in out.items()}

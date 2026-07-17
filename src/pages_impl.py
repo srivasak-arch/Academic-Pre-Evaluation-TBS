@@ -117,6 +117,8 @@ def queue_page():
     _audit("queue_view", detail={"n": len(rows), "programme": prog_code})
 
     decided = db.decided_application_ids(conn)
+    decision_values = db.latest_decision_values(conn)
+    decision_label = dict(DECISION_OPTIONS)
     st.write(f"**{len(rows)}** applications")
     if not rows:
         st.info("No applications match these filters. Try widening them.")
@@ -129,16 +131,53 @@ def queue_page():
         "Graduated": int(r["graduation_year"]),
         "Readiness": "Awaiting evidence" if (r["grade_irish_eq"] is None or r["english_level"] is None)
                      else "Ready to review",
-        "Decision": "Decided" if r["application_id"] in decided else "Undecided",
+        "Offer status": decision_label.get(decision_values.get(r["application_id"]), "Undecided"),
         "_id": r["application_id"],
     } for r in rows])
 
+    # ---- controls: sort (incl. offer status) + CSV export of the current view ----
+    # Export reproduces the original portal schema exactly, so reviewers can upload
+    # it back. "My Recommendation" carries the REVIEWER's recorded decision (the human
+    # recommendation) — never the legacy heuristic label, which the design excludes.
+    ctl1, ctl2 = st.columns([3, 1])
+    sort_by = ctl1.selectbox("Sort by", ["Applicant", "Programme", "Country",
+                                         "Graduated", "Readiness", "Offer status"],
+                             index=0, key="queue_sort",
+                             help="A view aid only — the queue is not ranked by quality.")
+
+    reco_label = {"offer": "Recommend offer", "reject": "Recommend reject",
+                  "defer": "Defer", "more_info": "Request more information"}
+    review_notes = db.notes_by_application(conn)
+    rows_by_id = {r["application_id"]: r for r in rows}
+    order = df.sort_values(sort_by, kind="stable")["_id"].tolist()
+    portal = pd.DataFrame([{
+        "ID": rows_by_id[i]["applicant_id"],
+        "Surname": rows_by_id[i]["surname"],
+        "Forename": rows_by_id[i]["forename"],
+        "Country": rows_by_id[i]["country_name"],
+        "Age": rows_by_id[i]["age"],
+        "Gender": rows_by_id[i]["gender"],
+        "Nationality": rows_by_id[i]["nationality_name"],
+        "Institution": rows_by_id[i]["institution_name"],
+        "Further info on institution": rows_by_id[i]["tier_label"],
+        "Subject area": rows_by_id[i]["subject_name"],
+        "Graduation Year": rows_by_id[i]["graduation_year"],
+        "Grade (Irish eq.)": rows_by_id[i]["grade_irish_eq"],
+        "English": rows_by_id[i]["english_level"],
+        "Work Experience": rows_by_id[i]["work_experience"],
+        "Years' experience": rows_by_id[i]["years_experience"],
+        "Notes": review_notes.get(i, ""),
+        "My Recommendation": reco_label.get(decision_values.get(i), ""),
+    } for i in order])
+    ctl2.download_button(
+        "Export CSV", portal.to_csv(index=False).encode("utf-8"),
+        file_name="applicants_reviewed.csv", mime="text/csv", width="stretch",
+        help="Portal-format export of the current filtered, sorted view. "
+             "‘My Recommendation’ holds the reviewer's recorded decision.",
+        on_click=lambda: _audit("queue_export_csv", detail={"n": len(portal)}))
+
     # ---- paginated rows, each with its own Review button ----
     PAGE_SIZE = 15
-    sort_by = st.selectbox("Sort by", ["Applicant", "Programme", "Country",
-                                       "Graduated", "Readiness", "Decision"],
-                           index=0, key="queue_sort",
-                           help="A view aid only — the queue is not ranked by quality.")
     df = df.sort_values(sort_by, kind="stable").reset_index(drop=True)
 
     n_pages = max(1, -(-len(df) // PAGE_SIZE))
@@ -148,7 +187,7 @@ def queue_page():
     widths = [2.2, 1.2, 1.8, 1.1, 1.8, 1.3, 1.1]
     hdr = st.columns(widths)
     for col, label in zip(hdr, ["Applicant", "Programme", "Country", "Graduated",
-                                "Readiness", "Decision", ""]):
+                                "Readiness", "Offer status", ""]):
         col.markdown(f"**{label}**")
     for _, r in view.iterrows():
         c = st.columns(widths)
@@ -157,9 +196,9 @@ def queue_page():
         c[2].markdown(r["Country"])
         c[3].markdown(str(r["Graduated"]))
         c[4].markdown(r["Readiness"])
-        c[5].markdown(r["Decision"])
+        c[5].markdown(r["Offer status"])
         if c[6].button("Review", key=f"review_{r['_id']}", type="secondary",
-                       use_container_width=True):
+                       width='stretch'):
             st.session_state["goto_application"] = int(r["_id"])
             st.switch_page(st.session_state["_pages"]["profile"])
     with st.expander("Legend — how to read the indicators"):
@@ -190,19 +229,31 @@ def profile_page():
         f'{row["subject_name"]} · {row["institution_name"]} · graduated {row["graduation_year"]}'
         f'</div>', unsafe_allow_html=True)
 
-    # School verification status (if a detection has been run for this applicant)
+    # School verification status + quick access (works from every applicant entry)
     sv = db.latest_school_verification(conn, row["applicant_id"])
-    if sv:
-        if sv["status"] in ("confirmed", "corrected") and sv["verified_school"]:
+    sv_cols = st.columns([4, 1])
+    with sv_cols[0]:
+        if sv and sv["status"] in ("confirmed", "corrected") and sv["verified_school"]:
             st.markdown(
                 f'<div class="idband">School verified: <b>{sv["verified_school"]}</b> '
                 f'({sv["detected_university"] or sv["declared_university"]}) · '
                 f'{sv["status"]} {sv["verified_at"]}</div>', unsafe_allow_html=True)
-        else:
+        elif sv:
             st.markdown(
                 f'<div class="idband">School verification <b>pending</b>: detected '
-                f'“{sv["detected_school"] or "—"}” — confirm it on the '
-                f'<b>School verification</b> page.</div>', unsafe_allow_html=True)
+                f'“{sv["detected_school"] or "—"}” — confirm it below.</div>',
+                unsafe_allow_html=True)
+        else:
+            st.markdown(
+                '<div class="idband">School not yet verified — the specific college '
+                'under the parent university has not been confirmed from the transcript.</div>',
+                unsafe_allow_html=True)
+    with sv_cols[1]:
+        label = "Review school" if (sv and sv["status"] == "pending") else \
+                ("View school" if sv else "Verify school")
+        if st.button(label, key=f"sv_quick_{app_id}", width='stretch'):
+            st.session_state["sv_focus_applicant"] = row["applicant_id"]
+            st.switch_page(st.session_state["_pages"]["school_ver"])
     st.markdown("<hr>", unsafe_allow_html=True)
 
     # (B) independent indicator row (loudest element)
@@ -210,10 +261,11 @@ def profile_page():
     _audit("applicant_open", entity_type="application", entity_id=app_id)
     st.markdown('<div class="section-label">Academic indicators (independent · advisory)</div>',
                 unsafe_allow_html=True)
-    chip_row(results, show_context_note=True)
+    chip_row(results, show_context_note=True, linked=True)
     legend()
 
-    # (C) progressive-disclosure evidence
+    # (C) evidence — always-visible anchored cards so a chip click lands on the
+    # expanded detail (and briefly highlights it), not a collapsed panel.
     groups = {
         "Academic & programme fit": ["academic_performance", "programme_prerequisites",
                                      "quantitative_readiness", "subject_alignment"],
@@ -223,16 +275,35 @@ def profile_page():
         "Evidence quality": ["document_completeness", "evidence_confidence"],
     }
     by_key = {r.key: r for r in results}
-    st.markdown('<div class="section-label">Evidence — why each indicator shows what it shows</div>',
+    # Cohort context for the clickable per-indicator insight (whole pool, cached).
+    cohort = load_insights_cached(conn)
+    st.markdown('<div class="section-label">Evidence — why each indicator shows what it shows'
+                ' · open an indicator to see how this applicant compares to the pool</div>',
                 unsafe_allow_html=True)
+    ACADEMIC_KEYS = {"academic_performance", "programme_prerequisites",
+                     "quantitative_readiness", "subject_alignment", "english_requirement",
+                     "graduation_recency"}
     for title, keys in groups.items():
-        with st.expander(title):
-            for k in keys:
-                r = by_key[k]
-                st.markdown(chip_html(r), unsafe_allow_html=True)
-                st.markdown(f'<div class="facet-reason">{r.reasoning}</div>', unsafe_allow_html=True)
-                with st.popover("Inputs used"):
-                    st.json(r.inputs)
+        st.markdown(f'<div class="evidence-group">{title}</div>', unsafe_allow_html=True)
+        for k in keys:
+            r = by_key[k]
+            st.markdown(
+                f'<div id="ev-{k}" class="facet-card">{chip_html(r)}'
+                f'<div class="facet-reason">{r.reasoning}</div></div>',
+                unsafe_allow_html=True)
+            bcols = st.columns([1, 1, 4])
+            with bcols[0].popover("Inputs used"):
+                st.json(r.inputs)
+            # Academic indicators are clickable for a cohort-comparison insight.
+            if k in ACADEMIC_KEYS and r.scale == "rag":
+                with bcols[1].popover("Insight"):
+                    _indicator_cohort_insight(cohort.eval_wide, k, r)
+
+    st.markdown("<hr>", unsafe_allow_html=True)
+
+    # (D) Prior education history — additional degrees (e.g. an existing Master's).
+    # Contextual only: shown to the reviewer, never fed to the ten scored indicators.
+    _education_history_section(conn, row["applicant_id"])
 
     st.markdown("<hr>", unsafe_allow_html=True)
 
@@ -348,7 +419,7 @@ def analytics_page():
     if longdf.empty:
         st.info("Not enough data in any group (after small-group suppression) to break this down.")
     else:
-        st.altair_chart(_stacked(longdf, grp_col), use_container_width=True)
+        st.altair_chart(_stacked(longdf, grp_col), width='stretch')
         concern = (longdf[longdf["colour"].isin(["red", "amber"])]
                    .groupby(grp_col)["pct"].sum().sort_values(ascending=False))
         hi = concern.index[0] if len(concern) else None
@@ -373,7 +444,7 @@ def analytics_page():
     tier_long, tier_supp = insights.crosstab_rag(df, ew, "tier_label", "academic_performance", min_n=12)
     if not tier_long.empty:
         st.markdown("**Academic Performance by institution type** (prestige-bias watch)")
-        st.altair_chart(_stacked(tier_long, "tier_label"), use_container_width=True)
+        st.altair_chart(_stacked(tier_long, "tier_label"), width='stretch')
         narrative(
             "Academic Performance colours split across institution categories.",
             why="Because institution prestige is deliberately excluded from scoring, this view lets "
@@ -535,7 +606,14 @@ def data_page():
         tiers = db.list_tiers(conn)                   # [(code, label)]
         subjects = db.list_subjects(conn)
         default_country = COUNTRY_NAMES.index("Ireland") if "Ireland" in COUNTRY_NAMES else 0
+
+        # Optional prior degrees, staged before submit (an applicant may hold several,
+        # e.g. a Bachelor's and a Master's). Context only — never scored.
+        st.session_state.setdefault("new_applicant_edu", [])
+        _prior_degrees_staging(subjects)
+
         with st.form("add_applicant", clear_on_submit=True):
+            st.markdown("**This application** — the qualification assessed by the indicators.")
             c1, c2 = st.columns(2)
             forename = c1.text_input("Forename")
             surname = c2.text_input("Surname")
@@ -578,7 +656,13 @@ def data_page():
                     work_experience=work, years_experience=int(yrs),
                     programme_code=programme)
                 app_id = services.add_student(conn, data, _user()["user_id"])
-                st.success(f"Added **{data['applicant_id']}** to {programme}. "
+                staged = st.session_state.get("new_applicant_edu", [])
+                for e in staged:
+                    db.add_education(conn, {**e, "applicant_id": data["applicant_id"]})
+                n_edu = len(staged)
+                st.session_state["new_applicant_edu"] = []
+                extra = (f" plus {n_edu} prior qualification(s)" if n_edu else "")
+                st.success(f"Added **{data['applicant_id']}** to {programme}{extra}. "
                            f"It's now in the work queue (application #{app_id}).")
 
     # ---- bulk CSV ----
@@ -680,15 +764,19 @@ def data_insights_page():
         country = c2.selectbox("Country", ["All"] + db.distinct_countries(conn), key="ins_country")
         english = c3.selectbox("English", ["All", "High", "Moderate", "Low", "Pending"], key="ins_eng")
         readiness = c4.selectbox("Readiness", ["All", "Ready to review", "Awaiting evidence"], key="ins_ready")
-        c5, c6, _ = st.columns(3)
+        c5, c6, c7 = st.columns(3)
         gy_min = c5.number_input("Graduated from", 2014, 2026, 2014, key="ins_gymin")
         gy_max = c6.number_input("Graduated to", 2014, 2026, 2026, key="ins_gymax")
+        offer = c7.selectbox("Offer status",
+                             ["All", "Recommend offer", "Request more information",
+                              "Defer", "Recommend reject", "Undecided"], key="ins_offer")
 
     data = load_insights_cached(
         conn, programme_code=prog_code,
         country=None if country == "All" else country,
         english=None if english == "All" else english,
         completeness=None if readiness == "All" else readiness,
+        offer_status=None if offer == "All" else offer,
         grad_year_min=int(gy_min) if gy_min > 2014 else None,
         grad_year_max=int(gy_max) if gy_max < 2026 else None)
     _audit("insights_view", detail={"n": data.n})
@@ -745,7 +833,7 @@ def data_insights_page():
     with colA:
         ct = insights.share_table(df, "country_name").head(12)
         st.markdown("**Country of origin** (top 12)")
-        st.altair_chart(_hbar(ct, "country_name"), use_container_width=True)
+        st.altair_chart(_hbar(ct, "country_name"), width='stretch')
         top_country = ct.iloc[0]
         top3 = round(ct.head(3)["pct"].sum(), 1)
         narrative(
@@ -760,7 +848,7 @@ def data_insights_page():
     with colB:
         gt = insights.share_table(df, "gender")
         st.markdown("**Gender**")
-        st.altair_chart(_hbar(gt, "gender"), use_container_width=True)
+        st.altair_chart(_hbar(gt, "gender"), width='stretch')
         gtop = gt.iloc[0]
         narrative(
             f"The most common recorded gender is {gtop['gender']} ({gtop['pct']}%).",
@@ -775,7 +863,7 @@ def data_insights_page():
                           y=alt.Y("count():Q", title="Applicants"),
                           tooltip=[alt.Tooltip("count():Q", title="Applicants")])
                   .properties(width="container", height=200))
-        st.altair_chart(age_ch, use_container_width=True)
+        st.altair_chart(age_ch, width='stretch')
         narrative(
             f"Ages run from {int(df['age'].min())} to {int(df['age'].max())}, median "
             f"{int(df['age'].median())}.",
@@ -784,7 +872,7 @@ def data_insights_page():
     with colD:
         pt = insights.share_table(df, "programme_name")
         st.markdown("**Target programme**")
-        st.altair_chart(_hbar(pt, "programme_name"), use_container_width=True)
+        st.altair_chart(_hbar(pt, "programme_name"), width='stretch')
         narrative(
             "Split of applications across the two MSc programmes in view.",
             why="Programme mix matters because prerequisites, quantitative expectations and the "
@@ -796,7 +884,7 @@ def data_insights_page():
     with colE:
         gb = insights.share_table(df, "grade_band", order=insights.GRADE_BANDS)
         st.markdown("**Grade band** (Irish equivalent)")
-        st.altair_chart(_hbar(gb, "grade_band", order=insights.GRADE_BANDS), use_container_width=True)
+        st.altair_chart(_hbar(gb, "grade_band", order=insights.GRADE_BANDS), width='stretch')
         first_21 = round(gb[gb["grade_band"].isin(["First (1.1)", "Upper Second (2.1)"])]["pct"].sum(), 1)
         not_on_file = float(gb[gb["grade_band"] == "Not on file"]["pct"].sum()) if \
             "Not on file" in gb["grade_band"].values else 0.0
@@ -811,7 +899,7 @@ def data_insights_page():
     with colF:
         it = insights.share_table(df, "tier_label")
         st.markdown("**Institution context** (neutral — not scored)")
-        st.altair_chart(_hbar(it, "tier_label", color="#8B939C"), use_container_width=True)
+        st.altair_chart(_hbar(it, "tier_label", color="#8B939C"), width='stretch')
         narrative(
             "Distribution of awarding-institution categories across the pool.",
             why="Shown for context only. Institution type is deliberately excluded from any "
@@ -822,7 +910,7 @@ def data_insights_page():
     with colG:
         sub = insights.share_table(df, "subject_name").head(12)
         st.markdown("**Subject area** (top 12)")
-        st.altair_chart(_hbar(sub, "subject_name"), use_container_width=True)
+        st.altair_chart(_hbar(sub, "subject_name"), width='stretch')
         qmix = insights.share_table(df, "quant_label")
         high_q = float(qmix[qmix["quant_label"] == "High quant"]["pct"].sum()) if \
             "High quant" in qmix["quant_label"].values else 0.0
@@ -834,7 +922,7 @@ def data_insights_page():
         qr = insights.rag_distribution(ew, "quantitative_readiness")
         st.markdown("**Quantitative readiness** (indicator)")
         if not qr.empty:
-            st.altair_chart(_rag_bar(qr), use_container_width=True)
+            st.altair_chart(_rag_bar(qr), width='stretch')
             g = insights.green_share(ew, "quantitative_readiness")
             narrative(
                 f"{g}% of applications are green on quantitative readiness.",
@@ -850,7 +938,7 @@ def data_insights_page():
         we_order = ["No experience", "Internships", "1-2 years", "3+ years"]
         wt = insights.share_table(df, "work_experience", order=we_order)
         st.markdown("**Work experience**")
-        st.altair_chart(_hbar(wt, "work_experience", order=we_order), use_container_width=True)
+        st.altair_chart(_hbar(wt, "work_experience", order=we_order), width='stretch')
         exp_any = round(wt[wt["work_experience"] != "No experience"]["pct"].sum(), 1)
         narrative(
             f"{exp_any}% report at least some experience (internships or more).",
@@ -865,7 +953,7 @@ def data_insights_page():
         st.markdown("**Graduation recency**")
         st.altair_chart(_hbar(rt, "recency",
                         order=["Recent (≤3y)", "Moderately recent (4–8y)", "Dated (>8y)"]),
-                        use_container_width=True)
+                        width='stretch')
         dated = float(rt[rt["recency"] == "Dated (>8y)"]["pct"].sum()) if \
             "Dated (>8y)" in rt["recency"].astype(str).values else 0.0
         narrative(
@@ -878,7 +966,7 @@ def data_insights_page():
         et = insights.share_table(df, "english_level", order=["High", "Moderate", "Low"])
         st.markdown("**English proficiency**")
         st.altair_chart(_hbar(et, "english_level", order=["High", "Moderate", "Low", "Not recorded"]),
-                        use_container_width=True)
+                        width='stretch')
         pending_eng = float(et[et["english_level"] == "Not recorded"]["pct"].sum()) if \
             "Not recorded" in et["english_level"].values else 0.0
         narrative(
@@ -891,7 +979,7 @@ def data_insights_page():
         ec = insights.rag_distribution(ew, "evidence_confidence")
         st.markdown("**Evidence confidence** (meta-signal)")
         if not ec.empty:
-            st.altair_chart(_rag_bar(ec), use_container_width=True)
+            st.altair_chart(_rag_bar(ec), width='stretch')
             narrative(
                 "How much of the pool rests on strong vs sparse evidence.",
                 why="This is about data quality, not applicant quality — it tells reviewers how "
@@ -909,7 +997,7 @@ def data_insights_page():
         dt = dd.value_counts().rename_axis("decision").reset_index(name="n")
         dt["pct"] = dt["n"].apply(lambda x: insights.pct(x, dt["n"].sum()))
         st.markdown("**Recorded reviewer decisions**")
-        st.altair_chart(_hbar(dt, "decision"), use_container_width=True)
+        st.altair_chart(_hbar(dt, "decision"), width='stretch')
         top_dec = dt.iloc[0]
         narrative(
             f"Among recorded decisions, the most common is '{top_dec['decision']}' ({top_dec['pct']}%).",
@@ -924,9 +1012,9 @@ def data_insights_page():
         dc = insights.rag_distribution(ew, "document_completeness")
         cc1, cc2 = st.columns(2)
         if not ap.empty:
-            cc1.altair_chart(_rag_bar(ap, "Academic Performance"), use_container_width=True)
+            cc1.altair_chart(_rag_bar(ap, "Academic Performance"), width='stretch')
         if not dc.empty:
-            cc2.altair_chart(_rag_bar(dc, "Document Completeness"), use_container_width=True)
+            cc2.altair_chart(_rag_bar(dc, "Document Completeness"), width='stretch')
         narrative(
             "Until decisions accumulate, these two indicators best describe how the pool looks "
             "going into review: academic strength and whether the evidence base is complete.",
@@ -939,7 +1027,7 @@ def data_insights_page():
                    "monitor the pool and sanity-check the indicators. It is never a decision.")
         if "baseline_label" in df.columns and df["baseline_label"].notna().any():
             bl = insights.share_table(df, "baseline_label")
-            st.altair_chart(_hbar(bl, "baseline_label", color="#8B939C"), use_container_width=True)
+            st.altair_chart(_hbar(bl, "baseline_label", color="#8B939C"), width='stretch')
             # relationship to academic band (the task's example narrative)
             tmp = df.dropna(subset=["baseline_label"]).copy()
             cross = (tmp.groupby(["grade_band", "baseline_label"]).size().reset_index(name="n"))
@@ -948,7 +1036,7 @@ def data_insights_page():
                 y=alt.Y("grade_band:N", title="Grade band", sort=insights.GRADE_BANDS),
                 color=alt.Color("n:Q", title="Applicants", scale=alt.Scale(scheme="blues")),
                 tooltip=["grade_band", "baseline_label", "n"]).properties(width="container", height=220))
-            st.altair_chart(heat, use_container_width=True)
+            st.altair_chart(heat, width='stretch')
             narrative(
                 "Stronger grade bands concentrate in the more positive legacy labels, but some "
                 "high-grade applicants still sit in the cautious labels.",
@@ -972,7 +1060,7 @@ def data_insights_page():
     colM, colN = st.columns(2)
     with colM:
         st.markdown("**Missing key fields**")
-        st.altair_chart(_hbar(miss, "field", color="#C44B5B"), use_container_width=True)
+        st.altair_chart(_hbar(miss, "field", color="#C44B5B"), width='stretch')
         worst = miss.sort_values("n", ascending=False).iloc[0]
         narrative(
             f"The most-missing field is {worst['field']} ({worst['pct']}%).",
@@ -984,7 +1072,7 @@ def data_insights_page():
         comp["label"] = comp["n_missing"].map({0: "Complete", 1: "1 field missing", 2: "2 missing", 3: "3 missing"})
         comp["pct"] = comp["n"].apply(lambda x: insights.pct(x, n))
         st.markdown("**Record completeness**")
-        st.altair_chart(_hbar(comp, "label"), use_container_width=True)
+        st.altair_chart(_hbar(comp, "label"), width='stretch')
         narrative(
             f"{complete_pct}% of records are fully complete.",
             why="Completeness is the routing signal: complete records can be decided now; "
@@ -1065,6 +1153,20 @@ def school_verification_page():
                "college/school, shows the exact evidence, and records your confirmation. "
                "The suggestion is advisory — you make the call.")
 
+    focus = st.session_state.get("sv_focus_applicant")
+    if focus:
+        existing = db.latest_school_verification(conn, focus)
+        if existing:
+            st.info(f"Showing school verification for **{focus}**. Its confirmed school "
+                    "appears on the applicant's profile.")
+        else:
+            st.info(f"No school verification exists for **{focus}** yet. Upload that "
+                    "applicant's transcript under **Run detection** to create one, then "
+                    "attach it back to the applicant.")
+        if st.button("Clear filter"):
+            st.session_state.pop("sv_focus_applicant", None)
+            st.rerun()
+
     tab_run, tab_queue = st.tabs(["Run detection", "Verification queue"])
 
     # ---------------- Run detection ----------------
@@ -1117,7 +1219,7 @@ def school_verification_page():
             "By": r["verified_by_name"] or "—",
             "At": r["verified_at"] or "—",
         } for r in rows])
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.dataframe(df, width='stretch', hide_index=True)
 
 
 def _sv_review_card(conn, row, school_names_for, university_names):
@@ -1232,7 +1334,7 @@ def predictive_analytics_page():
                      "Beats baseline": "✓" if m["passes"]["brier_beats_climatology"] else "✕",
                      "ECE ≤ 0.08": "✓" if m["passes"]["ece_within_0.08"] else "✕",
                      "AUC preserved": "✓" if m["passes"]["auc_not_degraded"] else "✕"})
-    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width='stretch')
 
     sel = res["models"][run["selected_model"]]
 
@@ -1251,7 +1353,7 @@ def predictive_analytics_page():
                 tooltip=["variant", "mean_predicted", "observed_rate", "count"])
              + alt.Chart(diag).mark_line(strokeDash=[4, 4], color="#9AA0A6")
                   .encode(x="x:Q", y="y:Q"))
-    st.altair_chart(chart, use_container_width=True)
+    st.altair_chart(chart, width='stretch')
     st.caption("Dashed line = perfect calibration. Points below the line mean "
                "over-confidence; above means under-confidence. Bin counts in tooltip — "
                "small bins are noisy at this N.")
@@ -1262,7 +1364,7 @@ def predictive_analytics_page():
     shap_df = pd.DataFrame(sel["shap"])
     st.altair_chart(alt.Chart(shap_df).mark_bar(color="#0E73B9").encode(
         x=alt.X("mean_abs_shap:Q", title="Mean |SHAP| contribution"),
-        y=alt.Y("feature:N", sort="-x", title=None)), use_container_width=True)
+        y=alt.Y("feature:N", sort="-x", title=None)), width='stretch')
     st.caption("Feature attributions corroborate the rule-based facets: grade and "
                "English dominate, mirroring the advisory indicators — evidence that the "
                "rules engine and the learnt model agree on what matters.")
@@ -1282,7 +1384,7 @@ def predictive_analytics_page():
                      and g.get("di_ratio") is not None else "Descriptive (n<30)",
         "Brier (group)": f"{g['brier']:.4f}" if g.get("brier") is not None else "—",
     } for g in fa["groups"]])
-    st.dataframe(fdf, hide_index=True, use_container_width=True)
+    st.dataframe(fdf, hide_index=True, width='stretch')
     st.caption("Small-N cells are reported descriptively, not audited — a stated "
                "limitation of the 420-record synthetic cohort.")
 
@@ -1379,3 +1481,154 @@ def _sv_create_applicant_form(conn, row):
                    "verification. The applicant is now in the work queue"
                    + ("" if has_grade else " as *awaiting evidence* until a grade "
                       "and English level are recorded") + ".")
+
+
+def _indicator_cohort_insight(eval_wide, key, result):
+    """Clickable per-indicator insight: this applicant vs the whole pool."""
+    ctx = insights.cohort_indicator_context(eval_wide, key, result.value)
+    if not ctx:
+        st.caption("No cohort data available for comparison yet.")
+        return
+    colour_name = {"green": "Green", "amber": "Amber", "red": "Red",
+                   "pending": "Pending"}.get(result.value, result.value)
+    st.markdown(f"**This applicant:** {colour_name} on {result.name}.")
+    if result.value == "green":
+        st.markdown(f"They sit in the strongest band. "
+                    f"**{ctx['same_share']}%** of the pool is also Green here.")
+    elif result.value == "pending":
+        st.markdown("Evidence is pending, so no comparison to the pool is meaningful yet.")
+    else:
+        st.markdown(f"**{ctx['better_share']}%** of the pool is on a stronger band than "
+                    f"this applicant for {result.name}; **{ctx['same_share']}%** share "
+                    f"their band.")
+    dist = pd.DataFrame(ctx["distribution"])
+    if not dist.empty:
+        order = ["green", "amber", "red", "pending"]
+        dist["colour"] = pd.Categorical(dist["colour"], order, ordered=True)
+        dist = dist.sort_values("colour")
+        chart = alt.Chart(dist).mark_bar().encode(
+            x=alt.X("pct:Q", title="% of pool"),
+            y=alt.Y("colour:N", sort=order, title=None),
+            color=alt.Color("colour:N",
+                scale=alt.Scale(domain=order,
+                    range=[PALETTE["green"]["bg"], PALETTE["amber"]["bg"],
+                           PALETTE["red"]["bg"], PALETTE["sparse"]["bg"]]),
+                legend=None),
+            tooltip=["colour", "n", "pct"])
+        st.altair_chart(chart, width='stretch')
+    st.caption("Cohort context only — this compares distributions, it does not rank "
+               "or score this applicant against others.")
+
+
+QUALIFICATION_OPTIONS = ["Bachelor's degree", "Master's degree", "Doctorate (PhD)",
+                         "Postgraduate diploma", "Diploma / certificate", "Professional qualification"]
+
+
+def _education_history_section(conn, applicant_id):
+    """Manage additional prior qualifications (multiple degrees per applicant).
+
+    This is CONTEXT for the reviewer, not a scored indicator: many applicants
+    already hold a prior degree (e.g. a Master's), which the primary record does
+    not capture. It is deliberately kept out of the ten-indicator evaluation.
+    """
+    subjects = db.list_subjects(conn)
+    st.markdown('<div class="section-label">Prior education history · additional '
+                'qualifications (context — not scored)</div>', unsafe_allow_html=True)
+    st.caption("Record further degrees the applicant already holds — for example a "
+               "Master's completed before this application. Shown to reviewers as "
+               "background; it does not feed the academic indicators above.")
+
+    existing = db.list_education(conn, applicant_id)
+    if existing:
+        for e in existing:
+            line = f"**{e['qualification']}** — {e['institution_name']}"
+            bits = [b for b in (e["subject_name"], e["country_name"],
+                                str(e["graduation_year"]) if e["graduation_year"] else None,
+                                e["grade_note"]) if b]
+            if bits:
+                line += " · " + " · ".join(bits)
+            cols = st.columns([6, 1])
+            cols[0].markdown(line)
+            if cols[1].button("Remove", key=f"edu_del_{e['education_id']}"):
+                db.delete_education(conn, e["education_id"])
+                _audit("education_remove", entity_type="applicant", entity_id=applicant_id)
+                st.rerun()
+    else:
+        st.caption("No additional qualifications recorded.")
+
+    with st.expander("Add a qualification"):
+        with st.form(f"edu_add_{applicant_id}", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            qual = c1.selectbox("Qualification", QUALIFICATION_OPTIONS)
+            inst = c2.text_input("Institution")
+            c3, c4, c5 = st.columns(3)
+            subj = c3.selectbox("Subject", ["—"] + subjects)
+            country = c4.text_input("Country")
+            year = c5.number_input("Graduation year", 1980, 2026, 2022)
+            grade = st.text_input("Grade (as stated on the certificate)",
+                                  placeholder="e.g. First Class, 3.7 GPA, Distinction")
+            st.caption("Grade is stored exactly as entered — it is not converted to an "
+                       "Irish equivalent, since scale conversion is a reviewer judgement.")
+            if st.form_submit_button("Add qualification", type="primary"):
+                if not inst.strip():
+                    st.error("An institution is required.")
+                else:
+                    db.add_education(conn, {
+                        "applicant_id": applicant_id, "qualification": qual,
+                        "institution_name": inst.strip(),
+                        "subject_name": None if subj == "—" else subj,
+                        "country_name": country.strip() or None,
+                        "graduation_year": int(year), "grade_note": grade.strip() or None})
+                    _audit("education_add", entity_type="applicant", entity_id=applicant_id,
+                           detail={"qualification": qual})
+                    st.rerun()
+
+
+def _prior_degrees_staging(subjects):
+    """Stage 0..n prior qualifications before the applicant is created.
+
+    Streamlit forms can't hold dynamic 'add another' controls, so degrees are
+    collected in session_state via a small sub-form and persisted on the main
+    submit. Context only — these never enter the ten scored indicators.
+    """
+    staged = st.session_state["new_applicant_edu"]
+    with st.expander(f"Prior degrees already held (optional) · {len(staged)} added"):
+        st.caption("Add any further qualifications the applicant already holds — for "
+                   "example a Bachelor's and a Master's. Shown to reviewers as "
+                   "background; they do not feed the indicators. Grade is stored "
+                   "exactly as entered (not converted to an Irish equivalent).")
+        if staged:
+            for idx, e in enumerate(staged):
+                bits = [b for b in (e.get("subject_name"), e.get("country_name"),
+                                    str(e["graduation_year"]) if e.get("graduation_year") else None,
+                                    e.get("grade_note")) if b]
+                line = f"**{e['qualification']}** — {e['institution_name']}"
+                if bits:
+                    line += " · " + " · ".join(bits)
+                cols = st.columns([6, 1])
+                cols[0].markdown(line)
+                if cols[1].button("Remove", key=f"new_edu_del_{idx}"):
+                    staged.pop(idx)
+                    st.rerun()
+
+        with st.form("new_edu_add", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            qual = c1.selectbox("Qualification", QUALIFICATION_OPTIONS, key="new_edu_qual")
+            inst = c2.text_input("Institution", key="new_edu_inst")
+            c3, c4, c5 = st.columns(3)
+            subj = c3.selectbox("Subject", ["—"] + subjects, key="new_edu_subj")
+            country = c4.text_input("Country", key="new_edu_country")
+            year = c5.number_input("Graduation year", 1980, 2026, 2020, key="new_edu_year")
+            grade = st.text_input("Grade (as stated on the certificate)",
+                                  placeholder="e.g. First Class, 3.7 GPA, Distinction",
+                                  key="new_edu_grade")
+            if st.form_submit_button("Add this degree"):
+                if not inst.strip():
+                    st.warning("An institution is required to add a degree.")
+                else:
+                    staged.append({
+                        "qualification": qual, "institution_name": inst.strip(),
+                        "subject_name": None if subj == "—" else subj,
+                        "country_name": country.strip() or None,
+                        "graduation_year": int(year), "grade_note": grade.strip() or None})
+                    st.rerun()

@@ -175,3 +175,17 @@ CREATE TABLE IF NOT EXISTS school_verification (
     created_at          TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_sv_applicant ON school_verification(applicant_id);
+
+-- ---------- Additional education history (prior degrees beyond the primary record) ----------
+CREATE TABLE IF NOT EXISTS education_history (
+    education_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+    applicant_id    TEXT NOT NULL REFERENCES applicant(applicant_id),
+    qualification   TEXT NOT NULL,
+    institution_name TEXT NOT NULL,
+    subject_name    TEXT,
+    country_name    TEXT,
+    graduation_year INTEGER,
+    grade_note      TEXT,
+    created_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_edu_applicant ON education_history(applicant_id);

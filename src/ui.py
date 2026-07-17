@@ -99,6 +99,23 @@ hr { border:none; border-top:1px solid var(--line); margin:0.8rem 0; }
 
 /* ---- Queue table ---- */
 .q-row { border-bottom: 1px solid var(--line); padding: 2px 0; }
+
+/* ---- Clickable indicator chips → anchored evidence cards ---- */
+html { scroll-behavior: smooth; }
+.chip-link { text-decoration: none; display: inline-block; cursor: pointer; }
+.chip-link:hover .chip { filter: brightness(0.98);
+    box-shadow: 0 2px 6px rgba(0,0,0,0.14); transform: translateY(-1px); }
+.chip-link .chip { transition: box-shadow .15s, transform .15s, filter .15s; }
+.evidence-group { font-weight: 600; color: #1F2937; font-size: 0.95rem;
+    margin: 16px 0 4px; }
+.facet-card { scroll-margin-top: 72px; border: 1px solid var(--line);
+    border-radius: 10px; padding: 10px 12px; margin: 8px 0; }
+@keyframes facetflash {
+    0%   { box-shadow: 0 0 0 3px rgba(14,115,185,0); }
+    18%  { box-shadow: 0 0 0 3px rgba(14,115,185,0.45); background: #EAF3FB; }
+    100% { box-shadow: 0 0 0 3px rgba(14,115,185,0); background: transparent; }
+}
+.facet-card:target { animation: facetflash 1.9s ease-out; border-color: #0E73B9; }
 </style>
 """
 
@@ -106,7 +123,7 @@ def inject_css():
     st.markdown(GLOBAL_CSS, unsafe_allow_html=True)
 
 
-def chip_html(result) -> str:
+def chip_html(result, link: bool = False) -> str:
     p = PALETTE.get(result.value, PALETTE["info"])
     klass = "chip"
     if result.confidence == "low":
@@ -117,12 +134,17 @@ def chip_html(result) -> str:
                  if result.scale != "confidence" else "")
     # short value word per scale
     word = p["word"] if result.scale != "neutral" else "Context"
-    return (
+    chip = (
         f'<div class="{klass}" style="background:{p["bg"]};color:{p["fg"]};border-color:{p["border"]};">'
         f'<div class="lab"><span>{p["icon"]}</span><span>{html.escape(result.name)}</span></div>'
         f'<div class="val">{html.escape(word)}</div>'
         f'{conf_line}</div>'
     )
+    if link and getattr(result, "key", None):
+        # anchor to the matching evidence card below (id="ev-<key>")
+        return (f'<a class="chip-link" href="#ev-{result.key}" '
+                f'title="Open the full evidence for {html.escape(result.name)}">{chip}</a>')
+    return chip
 
 
 def split_results(results):
@@ -139,12 +161,14 @@ def split_results(results):
     return scored, contextual
 
 
-def chip_row(results, show_context_note: bool = False):
+def chip_row(results, show_context_note: bool = False, linked: bool = False):
     scored, contextual = split_results(results)
-    chips = "".join(chip_html(r) for r in scored)
+    chips = "".join(chip_html(r, link=linked) for r in scored)
     st.markdown(f'<div class="chiprow">{chips}</div>', unsafe_allow_html=True)
+    if linked:
+        st.caption("Click any indicator to jump to its full evidence below.")
     if contextual:
-        ctx = "".join(chip_html(r) for r in contextual)
+        ctx = "".join(chip_html(r, link=linked) for r in contextual)
         st.markdown(
             f'<div class="chiprow context-strip">'
             f'<span class="context-strip-label">Context — informational only, not scored:</span>'

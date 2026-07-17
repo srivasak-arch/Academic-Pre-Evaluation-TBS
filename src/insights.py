@@ -47,6 +47,7 @@ class InsightData:
 def load_insight_data(conn, **filters) -> InsightData:
     """Fetch the filtered application set, its cached indicator outcomes, and the
     decisions recorded against it. Returns tidy DataFrames with derived columns."""
+    offer_status = filters.pop("offer_status", None)   # filtered post-query (decision-derived)
     rows = db.list_applications(conn, **filters)
     df = pd.DataFrame([dict(r) for r in rows])
     if df.empty:
@@ -63,6 +64,17 @@ def load_insight_data(conn, **filters) -> InsightData:
         else "Ready to review", axis=1)
     df["n_missing"] = df.apply(
         lambda r: sum(1 for f in KEY_FIELDS if _missing(r, f)), axis=1)
+
+    # offer status from the latest recorded decision (context; never a score)
+    reco_label = {"offer": "Recommend offer", "reject": "Recommend reject",
+                  "defer": "Defer", "more_info": "Request more information"}
+    dec_values = db.latest_decision_values(conn)
+    df["offer_status"] = df["application_id"].map(
+        lambda i: reco_label.get(dec_values.get(i), "Undecided"))
+    if offer_status:
+        df = df[df["offer_status"] == offer_status]
+        if df.empty:
+            return InsightData(df, pd.DataFrame(), pd.DataFrame(), 0)
 
     app_ids = df["application_id"].tolist()
     ev = pd.DataFrame([dict(r) for r in db.evaluations_for_applications(conn, app_ids)])
@@ -158,3 +170,29 @@ def colour_share(eval_wide, indicator, colour):
     total = d["n"].sum()
     c = d.loc[d["colour"] == colour, "n"].sum()
     return pct(c, total)
+
+
+# ---- per-applicant cohort comparison (used by the clickable indicator insight) ----
+RAG_LABEL = {"green": "Green", "amber": "Amber", "red": "Red", "pending": "Pending"}
+
+def cohort_indicator_context(eval_wide, indicator, applicant_colour):
+    """How one applicant's RAG value for an indicator compares to the cohort.
+
+    Returns {'distribution': [{'colour','n','pct'}...], 'applicant_colour',
+             'same_share', 'better_share'} where 'better_share' is the % of the
+             cohort on a stronger band than this applicant (green>amber>red).
+    """
+    dist = rag_distribution(eval_wide, indicator)
+    if dist.empty:
+        return None
+    total = int(dist["n"].sum())
+    rows = [{"colour": r["colour"], "n": int(r["n"]), "pct": r["pct"]}
+            for _, r in dist.iterrows()]
+    rank = {"green": 3, "amber": 2, "red": 1, "pending": 0}
+    a = rank.get(applicant_colour, 0)
+    better = sum(x["n"] for x in rows if rank.get(x["colour"], 0) > a)
+    same = sum(x["n"] for x in rows if x["colour"] == applicant_colour)
+    return {"distribution": rows, "total": total,
+            "applicant_colour": applicant_colour,
+            "same_share": pct(same, total),
+            "better_share": pct(better, total)}
