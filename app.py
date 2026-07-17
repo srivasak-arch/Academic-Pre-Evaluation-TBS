@@ -53,7 +53,8 @@ def build_navigation():
     admin = st.Page(P.admin_page, title="Administration", icon=":material/admin_panel_settings:")
     settings = st.Page(P.settings_page, title="Settings", icon=":material/settings:")
 
-    st.session_state["_pages"] = {"profile": profile, "queue": queue}
+    st.session_state["_pages"] = {"profile": profile, "queue": queue,
+                                  "school_ver": school_ver}
     return st.navigation({
         "Review": [queue, profile, school_ver, history],
         "Oversight & governance": [insights_pg, analytics, ml_pg, thresholds],
