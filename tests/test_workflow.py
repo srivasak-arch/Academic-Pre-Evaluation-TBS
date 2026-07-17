@@ -173,3 +173,39 @@ def test_fairness_crosstab_suppresses_small_groups(conn):
     if not longdf.empty:
         sizes = longdf.groupby("country_name")["n"].sum()
         assert (sizes >= 12).all()
+
+
+# ---------------- New features: offer-status sort, education history, CSV ----------------
+def test_latest_decision_values_returns_most_recent(conn):
+    import src.db as D
+    conn.execute("INSERT INTO decision(application_id,user_id,decision_value,rationale,"
+                 "indicator_snapshot_json,created_at) VALUES (1,1,'defer','a','[]',"
+                 "datetime('now','-1 minute'))")
+    conn.execute("INSERT INTO decision(application_id,user_id,decision_value,rationale,"
+                 "indicator_snapshot_json,created_at) VALUES (1,1,'offer','b','[]',"
+                 "datetime('now'))")
+    conn.commit()
+    vals = D.latest_decision_values(conn)
+    assert vals[1] == "offer"   # most recent (highest decision_id), not the earlier 'defer'
+
+
+def test_education_history_add_list_delete(conn):
+    import src.db as D
+    D._EDU_DDL_DONE = False
+    eid = D.add_education(conn, {
+        "applicant_id": "TBS-2026-0001", "qualification": "Master's degree",
+        "institution_name": "Trinity College Dublin", "subject_name": "Finance",
+        "country_name": "Ireland", "graduation_year": 2021, "grade_note": "First Class"})
+    rows = D.list_education(conn, "TBS-2026-0001")
+    assert len(rows) == 1 and rows[0]["qualification"] == "Master's degree"
+    assert rows[0]["grade_note"] == "First Class"          # stored verbatim, not normalised
+    D.delete_education(conn, eid)
+    assert D.list_education(conn, "TBS-2026-0001") == []
+    D._EDU_DDL_DONE = False
+
+
+def test_education_history_not_in_scored_indicators():
+    """Prior degrees are context only — must never become one of the ten indicators."""
+    from src.config import INDICATOR_ORDER
+    for k in INDICATOR_ORDER:
+        assert "education_history" not in k and "prior_degree" not in k
