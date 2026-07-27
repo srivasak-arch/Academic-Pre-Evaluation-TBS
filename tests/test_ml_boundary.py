@@ -36,7 +36,6 @@ def test_experiment_writes_only_ml_tables(tmp_path, monkeypatch):
     dst = tmp_path / "dashboard.db"
     shutil.copy("data/dashboard.db", dst)
     monkeypatch.setattr(dbmod, "DB_PATH", dst)
-    dbmod._ML_DDL_DONE = False
     conn = sqlite3.connect(dst)
     conn.row_factory = sqlite3.Row
     before = conn.execute("SELECT COUNT(*) FROM indicator_evaluation").fetchone()[0]
@@ -49,7 +48,6 @@ def test_experiment_writes_only_ml_tables(tmp_path, monkeypatch):
     assert conn.execute("SELECT COUNT(*) FROM ml_run").fetchone()[0] >= 1
     assert conn.execute("SELECT COUNT(*) FROM ml_prediction WHERE run_id=?",
                         (res["run_id"],)).fetchone()[0] == res["n_test"]
-    dbmod._ML_DDL_DONE = False
 
 
 # ---------------- Features: protected attributes stay out ----------------

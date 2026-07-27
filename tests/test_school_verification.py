@@ -107,7 +107,6 @@ def conn():
     db._SV_DDL_DONE = False           # force DDL on this fresh connection
     db.ensure_school_schema(c)
     yield c
-    db._SV_DDL_DONE = False
     c.close()
 
 
@@ -161,3 +160,38 @@ def test_attach_links_verification_to_existing_applicant(conn):
     assert row is not None and row["verification_id"] == ver_id
     # and the original document-derived key still resolves (provenance kept)
     assert db.latest_school_verification(conn, "APP-777")["verification_id"] == ver_id
+
+
+# ---------------- Applicant documents ----------------
+def test_documents_stored_listed_and_retrieved(conn):
+    doc_id = db.add_document(conn, {
+        "applicant_id": "APP-500", "doc_type": "transcript",
+        "filename": "APP-500_Transcript.pdf", "n_pages": 2,
+        "content": b"%PDF-1.4 fake transcript bytes"})
+    rows = db.list_documents(conn, "APP-500")
+    assert len(rows) == 1 and rows[0]["doc_type"] == "transcript"
+    assert rows[0]["n_bytes"] == len(b"%PDF-1.4 fake transcript bytes")
+    fname, content = db.get_document_content(conn, doc_id)
+    assert fname == "APP-500_Transcript.pdf" and content.startswith(b"%PDF")
+
+
+def test_documents_follow_applicant_and_survive_reupload(conn):
+    """Re-uploading must replace, not duplicate, and must not orphan the link."""
+    rec = {"applicant_id": "APP-501", "doc_type": "transcript",
+           "filename": "t.pdf", "n_pages": 1, "content": b"%PDF v1"}
+    db.add_document(conn, rec)
+    db.link_documents(conn, "APP-501", "TBS-2026-0009")
+    assert len(db.list_documents(conn, "TBS-2026-0009")) == 1
+
+    db.add_document(conn, {**rec, "content": b"%PDF v2"})   # same filename again
+    linked = db.list_documents(conn, "TBS-2026-0009")
+    assert len(linked) == 1, "re-upload duplicated or orphaned the document"
+    _, content = db.get_document_content(conn, linked[0]["document_id"])
+    assert content == b"%PDF v2", "re-upload did not replace the content"
+
+
+def test_documents_are_not_shared_between_applicants(conn):
+    db.add_document(conn, {"applicant_id": "APP-502", "doc_type": "cv",
+                           "filename": "cv.pdf", "n_pages": 1, "content": b"%PDF x"})
+    assert len(db.list_documents(conn, "APP-502")) == 1
+    assert db.list_documents(conn, "APP-503") == []

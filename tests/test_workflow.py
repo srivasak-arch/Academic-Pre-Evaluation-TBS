@@ -191,7 +191,6 @@ def test_latest_decision_values_returns_most_recent(conn):
 
 def test_education_history_add_list_delete(conn):
     import src.db as D
-    D._EDU_DDL_DONE = False
     eid = D.add_education(conn, {
         "applicant_id": "TBS-2026-0001", "qualification": "Master's degree",
         "institution_name": "Trinity College Dublin", "subject_name": "Finance",
@@ -201,7 +200,6 @@ def test_education_history_add_list_delete(conn):
     assert rows[0]["grade_note"] == "First Class"          # stored verbatim, not normalised
     D.delete_education(conn, eid)
     assert D.list_education(conn, "TBS-2026-0001") == []
-    D._EDU_DDL_DONE = False
 
 
 def test_education_history_not_in_scored_indicators():
@@ -209,3 +207,37 @@ def test_education_history_not_in_scored_indicators():
     from src.config import INDICATOR_ORDER
     for k in INDICATOR_ORDER:
         assert "education_history" not in k and "prior_degree" not in k
+
+
+# ---------------- Subject-area catalogue management ----------------
+def test_add_subject_rejects_case_insensitive_duplicate(conn):
+    import src.db as D
+    assert D.add_subject(conn, "Marine Biology", 1) is True
+    assert D.add_subject(conn, "marine biology", 2) is False   # duplicate, any case
+    assert "Marine Biology" in D.list_subjects(conn)
+
+
+def test_subject_in_use_cannot_be_deleted(conn):
+    """Records must never point at a subject that no longer exists."""
+    import src.db as D
+    used = conn.execute("SELECT subject_name FROM applicant LIMIT 1").fetchone()[0]
+    assert D.subject_usage_count(conn, used) > 0
+    assert D.delete_subject(conn, used) is False
+    assert used in D.list_subjects(conn)
+
+
+def test_new_subject_is_usable_by_the_rules_engine(conn):
+    """A subject added by an administrator must evaluate without special-casing."""
+    import src.db as D
+    from src.rules import evaluate_application
+    D.add_subject(conn, "Biomedical Engineering", 2)
+    lv = {r["subject_name"]: r["quant_level"] for r in D.list_subjects_with_levels(conn)}
+    assert lv["Biomedical Engineering"] == 2
+    results = evaluate_application(dict(
+        grade_irish_eq=70.0, english_level="High", subject_name="Biomedical Engineering",
+        subject_quant_level=lv["Biomedical Engineering"], institution_tier="Tier1",
+        tier_label="Research-intensive flagship university", graduation_year=2024,
+        work_experience="1-2 years", years_experience=2), "BA")
+    assert len(results) == 10
+    quant = next(r for r in results if r.key == "quantitative_readiness")
+    assert quant.value == "green"      # level 2 + grade >= 60
