@@ -32,6 +32,18 @@ def bootstrap_if_needed() -> None:
     build()
 
 
+def _has_table(conn, name: str) -> bool:
+    """Whether a table exists on THIS connection.
+
+    Schema guards must be per-connection, not module-global: a global flag makes
+    a second connection (tests, scripts, a rebuilt store) skip DDL it still
+    needs, surfacing later as 'no such table'.
+    """
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+    ).fetchone() is not None
+
+
 def get_connection() -> sqlite3.Connection:
     bootstrap_if_needed()
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -429,12 +441,10 @@ def evaluations_for_applications(conn, app_ids):
 
 
 # ---------- School verification (which school under the declared university) ----------
-_SV_DDL_DONE = False
 
 def ensure_school_schema(conn):
     """Idempotent migration for databases created before this feature existed."""
-    global _SV_DDL_DONE
-    if _SV_DDL_DONE:
+    if _has_table(conn, "school_verification"):
         return
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS school_verification (
@@ -466,7 +476,6 @@ def ensure_school_schema(conn):
     if "prefill_json" not in cols:
         conn.execute("ALTER TABLE school_verification ADD COLUMN prefill_json TEXT")
     conn.commit()
-    _SV_DDL_DONE = True
 
 
 def add_school_verification(conn, rec: dict) -> int:
@@ -538,11 +547,9 @@ def list_applicants_brief(conn, limit=1000):
 
 
 # ---------- Research-track ML tables (NEVER feed the advisory indicators) ----------
-_ML_DDL_DONE = False
 
 def ensure_ml_schema(conn):
-    global _ML_DDL_DONE
-    if _ML_DDL_DONE:
+    if _has_table(conn, "ml_run"):
         return
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS ml_run (
@@ -569,7 +576,6 @@ def ensure_ml_schema(conn):
         CREATE INDEX IF NOT EXISTS idx_mlpred_run ON ml_prediction(run_id);
     """)
     conn.commit()
-    _ML_DDL_DONE = True
 
 
 def add_ml_run(conn, rec: dict) -> int:
@@ -611,11 +617,9 @@ def latest_decision_values(conn):
 
 
 # ---------- Additional education history (prior degrees beyond the primary record) ----------
-_EDU_DDL_DONE = False
 
 def ensure_education_schema(conn):
-    global _EDU_DDL_DONE
-    if _EDU_DDL_DONE:
+    if _has_table(conn, "education_history"):
         return
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS education_history (
@@ -632,7 +636,6 @@ def ensure_education_schema(conn):
         CREATE INDEX IF NOT EXISTS idx_edu_applicant ON education_history(applicant_id);
     """)
     conn.commit()
-    _EDU_DDL_DONE = True
 
 
 def add_education(conn, rec: dict) -> int:
@@ -671,3 +674,119 @@ def notes_by_application(conn):
     for r in rows:
         out.setdefault(r["application_id"], []).append(r["body"])
     return {aid: " | ".join(bodies) for aid, bodies in out.items()}
+
+
+# ---------- Subject-area catalogue management ----------
+def list_subjects_with_levels(conn):
+    """[(subject_name, quant_level)] for administration and reporting."""
+    return conn.execute(
+        "SELECT subject_name, quant_level FROM subject_area ORDER BY subject_name").fetchall()
+
+
+def add_subject(conn, subject_name: str, quant_level: int) -> bool:
+    """Add a subject area. Returns False if it already exists (case-insensitive)."""
+    name = " ".join(subject_name.strip().split())
+    if not name:
+        return False
+    exists = conn.execute(
+        "SELECT 1 FROM subject_area WHERE LOWER(subject_name)=LOWER(?)", (name,)).fetchone()
+    if exists:
+        return False
+    conn.execute("INSERT INTO subject_area(subject_name, quant_level) VALUES (?,?)",
+                 (name, int(quant_level)))
+    conn.commit()
+    return True
+
+
+def update_subject_level(conn, subject_name: str, quant_level: int):
+    conn.execute("UPDATE subject_area SET quant_level=? WHERE subject_name=?",
+                 (int(quant_level), subject_name))
+    conn.commit()
+
+
+def subject_usage_count(conn, subject_name: str) -> int:
+    return conn.execute("SELECT COUNT(*) FROM applicant WHERE subject_name=?",
+                        (subject_name,)).fetchone()[0]
+
+
+def delete_subject(conn, subject_name: str) -> bool:
+    """Delete a subject only if no applicant references it."""
+    if subject_usage_count(conn, subject_name) > 0:
+        return False
+    conn.execute("DELETE FROM subject_area WHERE subject_name=?", (subject_name,))
+    conn.commit()
+    return True
+
+
+# ---------- Applicant documents (uploaded PDFs, stored alongside the record) ----------
+
+def ensure_documents_schema(conn):
+    if _has_table(conn, "applicant_document"):
+        return
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS applicant_document (
+            document_id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            applicant_id        TEXT NOT NULL,     -- key used at upload time
+            linked_applicant_id TEXT,              -- real record, once attached
+            doc_type            TEXT NOT NULL,     -- transcript / reference_academic / cv / other
+            filename            TEXT NOT NULL,
+            n_pages             INTEGER,
+            n_bytes             INTEGER,
+            content             BLOB NOT NULL,
+            uploaded_by         INTEGER REFERENCES app_user(user_id),
+            uploaded_at         TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_doc_applicant ON applicant_document(applicant_id);
+        CREATE INDEX IF NOT EXISTS idx_doc_linked ON applicant_document(linked_applicant_id);
+    """)
+    conn.commit()
+
+
+def add_document(conn, rec: dict) -> int:
+    """Store an uploaded document. Re-uploading the same filename for the same
+    applicant replaces the previous copy rather than accumulating duplicates,
+    preserving any link to a real applicant record so the replacement does not
+    orphan the document."""
+    ensure_documents_schema(conn)
+    prior = conn.execute(
+        "SELECT linked_applicant_id FROM applicant_document "
+        "WHERE applicant_id=? AND filename=?",
+        (rec["applicant_id"], rec["filename"])).fetchone()
+    linked = rec.get("linked_applicant_id") or (prior["linked_applicant_id"] if prior else None)
+    conn.execute("DELETE FROM applicant_document WHERE applicant_id=? AND filename=?",
+                 (rec["applicant_id"], rec["filename"]))
+    cur = conn.execute(
+        "INSERT INTO applicant_document (applicant_id, linked_applicant_id, doc_type, "
+        "filename, n_pages, n_bytes, content, uploaded_by, uploaded_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        (rec["applicant_id"], linked, rec["doc_type"], rec["filename"],
+         rec.get("n_pages"), len(rec["content"]), rec["content"],
+         rec.get("uploaded_by"), now_iso()))
+    conn.commit()
+    return cur.lastrowid
+
+
+def list_documents(conn, applicant_id):
+    """Documents for an applicant, by upload key or by the linked real record.
+    Content is omitted so listings stay cheap."""
+    ensure_documents_schema(conn)
+    return conn.execute(
+        "SELECT document_id, applicant_id, linked_applicant_id, doc_type, filename, "
+        "n_pages, n_bytes, uploaded_at FROM applicant_document "
+        "WHERE applicant_id=? OR linked_applicant_id=? "
+        "ORDER BY doc_type, filename", (applicant_id, applicant_id)).fetchall()
+
+
+def get_document_content(conn, document_id):
+    ensure_documents_schema(conn)
+    row = conn.execute("SELECT filename, content FROM applicant_document "
+                       "WHERE document_id=?", (document_id,)).fetchone()
+    return (row["filename"], row["content"]) if row else (None, None)
+
+
+def link_documents(conn, source_applicant_id, target_applicant_id):
+    """Attach documents uploaded under a temporary key to a real applicant record."""
+    ensure_documents_schema(conn)
+    conn.execute("UPDATE applicant_document SET linked_applicant_id=? WHERE applicant_id=?",
+                 (target_applicant_id, source_applicant_id))
+    conn.commit()

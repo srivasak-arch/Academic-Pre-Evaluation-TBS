@@ -301,7 +301,12 @@ def profile_page():
 
     st.markdown("<hr>", unsafe_allow_html=True)
 
-    # (D) Prior education history — additional degrees (e.g. an existing Master's).
+    # (D) Documents on file, if any have been uploaded for this applicant.
+    _documents_section(conn, row["applicant_id"])
+
+    st.markdown("<hr>", unsafe_allow_html=True)
+
+    # (E) Prior education history — additional degrees (e.g. an existing Master's).
     # Contextual only: shown to the reviewer, never fed to the ten scored indicators.
     _education_history_section(conn, row["applicant_id"])
 
@@ -574,12 +579,96 @@ def admin_page():
         "Username": u["username"], "Name": u["display_name"], "Role": u["role"],
         "Active": bool(u["is_active"])} for u in users]),
         width="stretch", hide_index=True)
+    st.markdown("---")
+    _subject_admin(conn)
+
+    st.markdown("---")
     st.markdown("**Recent activity (audit log)**")
     audit = db.list_audit(conn, limit=200)
     st.dataframe(pd.DataFrame([{
         "When": a["created_at"], "User": a["display_name"], "Action": a["action"],
         "Entity": a["entity_type"], "Id": a["entity_id"]} for a in audit]),
         width="stretch", hide_index=True)
+
+
+QUANT_LEVEL_LABELS = {
+    0: "0 — Low quantitative content",
+    1: "1 — Moderate quantitative content",
+    2: "2 — Highly quantitative",
+}
+
+
+def _subject_admin(conn):
+    """Manage the subject-area catalogue.
+
+    Each subject carries a quantitative level (0-2) because the Quantitative
+    Readiness and Programme Prerequisites indicators are computed from it; a
+    subject cannot be added without one, or the rules engine would have no basis
+    on which to evaluate applicants holding that degree.
+    """
+    st.markdown("**Subject areas**")
+    st.caption("The catalogue offered wherever a subject is selected. Each subject needs a "
+               "quantitative level, since Quantitative Readiness and Programme Prerequisites "
+               "are derived from it (see Table 4.1). Changing a level re-evaluates future "
+               "assessments, not decisions already recorded.")
+
+    rows = db.list_subjects_with_levels(conn)
+    st.dataframe(pd.DataFrame([{
+        "Subject area": r["subject_name"],
+        "Quantitative level": QUANT_LEVEL_LABELS.get(r["quant_level"], r["quant_level"]),
+        "Applicants using it": db.subject_usage_count(conn, r["subject_name"]),
+    } for r in rows]), width="stretch", hide_index=True)
+
+    c_add, c_edit = st.columns(2)
+
+    with c_add:
+        with st.expander("Add a subject area"):
+            with st.form("add_subject", clear_on_submit=True):
+                name = st.text_input("Subject name", placeholder="e.g. Biomedical Engineering")
+                level = st.selectbox("Quantitative level", [0, 1, 2], index=1,
+                                     format_func=lambda v: QUANT_LEVEL_LABELS[v])
+                if st.form_submit_button("Add subject", type="primary"):
+                    if not name.strip():
+                        st.error("A subject name is required.")
+                    elif db.add_subject(conn, name, level):
+                        _audit("subject_added", entity_type="subject_area",
+                               entity_id=name.strip(), detail={"quant_level": level})
+                        st.success(f"Added **{name.strip()}**. It is now selectable "
+                                   "wherever a subject is chosen.")
+                        st.rerun()
+                    else:
+                        st.warning(f"“{name.strip()}” is already in the catalogue.")
+
+    with c_edit:
+        with st.expander("Edit or remove a subject area"):
+            names = [r["subject_name"] for r in rows]
+            pick = st.selectbox("Subject", names, index=None,
+                                placeholder="Search or select a subject…",
+                                key="subj_edit_pick")
+            if pick:
+                current = next(r["quant_level"] for r in rows if r["subject_name"] == pick)
+                in_use = db.subject_usage_count(conn, pick)
+                new_level = st.selectbox("Quantitative level", [0, 1, 2],
+                                         index=[0, 1, 2].index(current),
+                                         format_func=lambda v: QUANT_LEVEL_LABELS[v],
+                                         key="subj_edit_level")
+                b1, b2 = st.columns(2)
+                if b1.button("Save level", disabled=(new_level == current),
+                             width="stretch"):
+                    db.update_subject_level(conn, pick, new_level)
+                    _audit("subject_level_changed", entity_type="subject_area",
+                           entity_id=pick, detail={"from": current, "to": new_level})
+                    st.success(f"**{pick}** is now level {new_level}.")
+                    st.rerun()
+                if b2.button("Remove subject", disabled=(in_use > 0), width="stretch"):
+                    if db.delete_subject(conn, pick):
+                        _audit("subject_removed", entity_type="subject_area", entity_id=pick)
+                        st.success(f"Removed **{pick}**.")
+                        st.rerun()
+                if in_use > 0:
+                    st.caption(f"{in_use} applicant(s) use this subject, so it cannot be "
+                               "removed. Records must never be left pointing at a subject "
+                               "that no longer exists.")
 
 
 # ---------------------------------------------------------------------------
@@ -1183,12 +1272,16 @@ def school_verification_page():
             placeholder="e.g. University of Delhi")
 
         if uploads and st.button("Run detection", type="primary"):
-            grouped = SV.group_uploads([(u.name, u.getvalue()) for u in uploads])
-            for app_key, docs in sorted(grouped.items()):
+            detailed = SV.group_uploads_detailed([(u.name, u.getvalue()) for u in uploads])
+            n_docs = 0
+            for app_key, meta in sorted(detailed.items()):
+                docs = {dt: m["pages"] for dt, m in meta.items()}
                 ver_id, det = SV.run_verification(
                     conn, app_key, docs, declared or None, _user()["user_id"])
+                n_docs += SV.store_documents(conn, app_key, meta, _user()["user_id"])
                 st.session_state.setdefault("sv_last_run", []).append(ver_id)
-            st.success(f"Detection run for {len(grouped)} applicant(s). "
+            st.success(f"Detection run for {len(detailed)} applicant(s); "
+                       f"{n_docs} document(s) stored against their records. "
                        "Review and confirm below.")
             st.rerun()
 
@@ -1525,6 +1618,7 @@ QUALIFICATION_OPTIONS = ["Bachelor's degree", "Master's degree", "Doctorate (PhD
 
 
 def _education_history_section(conn, applicant_id):
+    from .countries import COUNTRY_NAMES
     """Manage additional prior qualifications (multiple degrees per applicant).
 
     This is CONTEXT for the reviewer, not a scored indicator: many applicants
@@ -1563,7 +1657,8 @@ def _education_history_section(conn, applicant_id):
             inst = c2.text_input("Institution")
             c3, c4, c5 = st.columns(3)
             subj = c3.selectbox("Subject", ["—"] + subjects)
-            country = c4.text_input("Country")
+            country = c4.selectbox("Country", COUNTRY_NAMES, index=None,
+                                   placeholder="Type to search…")
             year = c5.number_input("Graduation year", 1980, 2026, 2022)
             grade = st.text_input("Grade (as stated on the certificate)",
                                   placeholder="e.g. First Class, 3.7 GPA, Distinction")
@@ -1577,7 +1672,7 @@ def _education_history_section(conn, applicant_id):
                         "applicant_id": applicant_id, "qualification": qual,
                         "institution_name": inst.strip(),
                         "subject_name": None if subj == "—" else subj,
-                        "country_name": country.strip() or None,
+                        "country_name": country or None,
                         "graduation_year": int(year), "grade_note": grade.strip() or None})
                     _audit("education_add", entity_type="applicant", entity_id=applicant_id,
                            detail={"qualification": qual})
@@ -1585,6 +1680,7 @@ def _education_history_section(conn, applicant_id):
 
 
 def _prior_degrees_staging(subjects):
+    from .countries import COUNTRY_NAMES
     """Stage 0..n prior qualifications before the applicant is created.
 
     Streamlit forms can't hold dynamic 'add another' controls, so degrees are
@@ -1617,7 +1713,8 @@ def _prior_degrees_staging(subjects):
             inst = c2.text_input("Institution", key="new_edu_inst")
             c3, c4, c5 = st.columns(3)
             subj = c3.selectbox("Subject", ["—"] + subjects, key="new_edu_subj")
-            country = c4.text_input("Country", key="new_edu_country")
+            country = c4.selectbox("Country", COUNTRY_NAMES, index=None,
+                                   placeholder="Type to search…", key="new_edu_country")
             year = c5.number_input("Graduation year", 1980, 2026, 2020, key="new_edu_year")
             grade = st.text_input("Grade (as stated on the certificate)",
                                   placeholder="e.g. First Class, 3.7 GPA, Distinction",
@@ -1629,6 +1726,57 @@ def _prior_degrees_staging(subjects):
                     staged.append({
                         "qualification": qual, "institution_name": inst.strip(),
                         "subject_name": None if subj == "—" else subj,
-                        "country_name": country.strip() or None,
+                        "country_name": country or None,
                         "graduation_year": int(year), "grade_note": grade.strip() or None})
                     st.rerun()
+
+
+DOC_TYPE_LABELS = {
+    "transcript": "Academic transcript",
+    "reference_academic": "Academic reference",
+    "reference_professional": "Professional reference",
+    "cv": "CV",
+    "other": "Other document",
+}
+
+
+def _documents_section(conn, applicant_id):
+    """Show documents uploaded for this applicant, if any.
+
+    Documents are stored when school verification is run on an applicant's PDFs;
+    they follow the applicant when a verification is attached to a real record.
+    The section is silent when nothing has been uploaded, so profiles for the
+    synthetic cohort stay uncluttered.
+    """
+    docs = db.list_documents(conn, applicant_id)
+    if not docs:
+        return
+
+    sv = db.latest_school_verification(conn, applicant_id)
+    evidence_doc = sv["source_document"] if sv else None
+
+    st.markdown('<div class="section-label">Documents on file</div>',
+                unsafe_allow_html=True)
+    st.caption("Uploaded during school verification. The transcript is the "
+               "authoritative source for the school; the CV is never used for it.")
+
+    for d in docs:
+        label = DOC_TYPE_LABELS.get(d["doc_type"], d["doc_type"])
+        size_kb = (d["n_bytes"] or 0) / 1024
+        cols = st.columns([3, 2, 2, 1.4])
+        badge = " · **evidence source**" if d["doc_type"] == evidence_doc else ""
+        cols[0].markdown(f"**{label}**{badge}")
+        cols[1].markdown(f"`{d['filename']}`")
+        cols[2].caption(f"{d['n_pages'] or '?'} page(s) · {size_kb:.0f} KB · "
+                        f"uploaded {d['uploaded_at'][:10]}")
+        fname, content = db.get_document_content(conn, d["document_id"])
+        if content is not None:
+            cols[3].download_button("Open", content, file_name=fname,
+                                    mime="application/pdf",
+                                    key=f"dl_{d['document_id']}", width="stretch")
+
+    if sv and sv["evidence_snippet"]:
+        with st.expander("Evidence extracted from these documents"):
+            src = DOC_TYPE_LABELS.get(sv["source_document"], sv["source_document"])
+            st.markdown(f"School detected from the **{src}**, page {sv['source_page']}:")
+            st.info(sv["evidence_snippet"])

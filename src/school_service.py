@@ -48,16 +48,36 @@ def applicant_key_from_filename(filename: str) -> str:
     return m.group(1) if m else filename.rsplit(".", 1)[0]
 
 
-def group_uploads(files) -> dict[str, dict[str, list[dict]]]:
-    """[(filename, bytes)] -> {applicant_key: {doc_type: pages}}.
+def group_uploads_detailed(files) -> dict[str, dict[str, dict]]:
+    """[(filename, bytes)] -> {applicant_key: {doc_type: {pages, filename, data}}}.
+    Keeps the raw bytes so documents can be stored against the applicant record.
     If two files of the same type collide for one applicant, the first wins."""
-    grouped: dict[str, dict[str, list[dict]]] = {}
+    grouped: dict[str, dict[str, dict]] = {}
     for filename, data in files:
         pages = extract_pages(data)
         key = applicant_key_from_filename(filename)
         doc_type = classify_document(filename, pages)
-        grouped.setdefault(key, {}).setdefault(doc_type, pages)
+        grouped.setdefault(key, {}).setdefault(
+            doc_type, {"pages": pages, "filename": filename, "data": data})
     return grouped
+
+
+def group_uploads(files) -> dict[str, dict[str, list[dict]]]:
+    """{applicant_key: {doc_type: pages}} — the detection view of the uploads."""
+    return {k: {dt: v["pages"] for dt, v in docs.items()}
+            for k, docs in group_uploads_detailed(files).items()}
+
+
+def store_documents(conn, applicant_key: str, detailed: dict[str, dict], user_id=None) -> int:
+    """Persist the uploaded PDFs against the applicant key. Returns count stored."""
+    n = 0
+    for doc_type, meta in detailed.items():
+        db.add_document(conn, {
+            "applicant_id": applicant_key, "doc_type": doc_type,
+            "filename": meta["filename"], "n_pages": len(meta["pages"]),
+            "content": meta["data"], "uploaded_by": user_id})
+        n += 1
+    return n
 
 
 def run_verification(conn, applicant_id: str, docs: dict[str, list[dict]],
@@ -98,8 +118,14 @@ def confirm_school(conn, verification_id: int, detected_school: str | None,
 
 
 def attach_to_applicant(conn, verification_id: int, applicant_id: str, user_id) -> None:
-    """A: link a document-derived verification to an existing applicant record."""
+    """A: link a document-derived verification to an existing applicant record.
+    Any documents uploaded under the temporary key follow the verification."""
+    row = db.latest_school_verification(conn, applicant_id) or {}
     db.link_school_verification(conn, verification_id, applicant_id)
+    src = conn.execute("SELECT applicant_id FROM school_verification WHERE verification_id=?",
+                       (verification_id,)).fetchone()
+    if src:
+        db.link_documents(conn, src["applicant_id"], applicant_id)
     db.audit(conn, user_id, "school_verification_linked",
              entity_type="school_verification", entity_id=str(verification_id),
              detail={"linked_applicant_id": applicant_id})
